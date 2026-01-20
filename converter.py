@@ -5,6 +5,8 @@ Polars tabanlı yüksek performanslı dönüştürme motoru
 
 import polars as pl
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +24,29 @@ class ConversionResult:
         self.elapsed = elapsed
         self.error = error
 
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DataFrame'i Parquet uyumlu hale getirir.
+    Karışık tip sütunları ve özel değerleri temizler.
+    """
+    import numpy as np
+    
+    for col in df.columns:
+        # inf değerlerini NaN'a çevir
+        if df[col].dtype in ['float64', 'float32']:
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+        
+        # object tipi sütunları string'e dönüştür (bytes vs int karışıklığını önler)
+        if df[col].dtype == 'object':
+            try:
+                # Karışık tipleri string'e zorla
+                df[col] = df[col].apply(lambda x: str(x) if pd.notna(x) and x is not None else None)
+            except Exception:
+                # Son çare: tüm sütunu string'e çevir
+                df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
+    
+    return df
+
 def convert_excel_to_parquet(
     input_path: str,
     output_path: str = None,
@@ -29,7 +54,7 @@ def convert_excel_to_parquet(
 ) -> ConversionResult:
     """
     Excel dosyasını Parquet formatına dönüştürür.
-    Pandas fallback ile maksimum uyumluluk sağlar.
+    PyArrow ile doğrudan yazma - maksimum uyumluluk.
     """
     start_time = time.time()
     
@@ -47,31 +72,39 @@ def convert_excel_to_parquet(
         if progress_callback:
             progress_callback(10)
         
-        # Pandas ile Excel okuma (daha güvenilir, inf/nan işleme dahil)
-        df_pandas = pd.read_excel(input_path)
+        # Pandas ile Excel okuma
+        df_pandas = pd.read_excel(input_path, engine='openpyxl')
         
         if progress_callback:
-            progress_callback(40)
+            progress_callback(30)
         
-        # inf değerlerini NaN'a çevir
-        import numpy as np
-        df_pandas = df_pandas.replace([np.inf, -np.inf], np.nan)
+        # DataFrame'i temizle
+        df_pandas = clean_dataframe(df_pandas)
         
         if progress_callback:
-            progress_callback(60)
+            progress_callback(50)
         
-        # Polars'a dönüştür
-        df = pl.from_pandas(df_pandas)
+        # PyArrow Table'a dönüştür (daha güvenilir)
+        try:
+            table = pa.Table.from_pandas(df_pandas, preserve_index=False)
+        except Exception as e:
+            # Fallback: Sütun sütun dönüştür
+            columns = []
+            for col in df_pandas.columns:
+                try:
+                    arr = pa.array(df_pandas[col].tolist())
+                except Exception:
+                    # String'e zorla
+                    arr = pa.array([str(x) if pd.notna(x) else None for x in df_pandas[col]])
+                columns.append(arr)
+            
+            table = pa.table(dict(zip(df_pandas.columns, columns)))
         
         if progress_callback:
             progress_callback(80)
         
-        # Parquet olarak kaydet (Snappy sıkıştırma ile)
-        df.write_parquet(
-            output_path,
-            compression="snappy",
-            use_pyarrow=True
-        )
+        # Parquet olarak kaydet
+        pq.write_table(table, output_path, compression='snappy')
         
         if progress_callback:
             progress_callback(100)
