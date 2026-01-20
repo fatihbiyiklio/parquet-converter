@@ -1,0 +1,9 @@
+polars
+pyarrow
+openpyxl
+xlrd
+fastexcel
+pandas
+numpy
+PyQt6
+pyinstaller
