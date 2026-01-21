@@ -9,6 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import os
 import time
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
@@ -27,79 +28,68 @@ class ConversionResult:
 def clean_dataframe_for_powerbi(df: pd.DataFrame) -> pd.DataFrame:
     """
     DataFrame'i Power BI uyumlu Parquet formatına hazırlar.
-    - NaT, null, None değerleri boş string'e çevirir
-    - Karışık tip sütunları string'e dönüştürür
-    - inf değerlerini temizler
+    - Tipleri korumaya çalışır (String'e zorlamaz)
+    - Null değerleri PyArrow'un anlayacağı formatta bırakır (None, NaN, NaT)
     """
-    import numpy as np
+    # Kolon isimlerini string yap (zorunlu)
+    df.columns = df.columns.astype(str)
     
     for col in df.columns:
-        dtype = df[col].dtype
+        # object/mixed tipleri analiz et ve mümkünse dönüştür
+        if df[col].dtype == 'object':
+            try:
+                # Sayısal veri var mı diye bak (coerce hataları NaN yapar)
+                df_numeric = pd.to_numeric(df[col], errors='coerce')
+                # Eğer verinin çoğu sayıysa ve sadece az sayıda NaN varsa, değişim mantıklıdır.
+                # Ancak burada basitlik adına: Eğer orijinalde sayısal olmayan değer neredeyse yoksa dönüştür.
+                # Ama güvenli olması için object olarak bırakmak çoğu zaman daha iyidir, 
+                # fakat Power BI için explicit type conversion gerekebilir.
+                pass 
+            except:
+                pass
+
+        # Integer sütunları - nullable int desteği için Int64'e çevir
+        if pd.api.types.is_integer_dtype(df[col]):
+            # Zaten nullable değilse ve null yoksa dokunma, ama standart olması için Int64 yapabiliriz
+            df[col] = df[col].astype('Int64')
         
-        # Datetime sütunları - NaT değerlerini boş string'e çevir
-        if pd.api.types.is_datetime64_any_dtype(dtype):
-            df[col] = df[col].apply(
-                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else ""
-            )
-            continue
+        # Float olup aslında integer olanları (örn: 12.0) Int64 yapmayı deneyebiliriz?
+        # Şimdilik float kalsın, Power BI float sever.
         
-        # Tamamen null olan sütunları boş string yap
-        if df[col].isna().all():
-            df[col] = ""
-            continue
-        
-        # Float sütunları - inf ve NaN'ı boş string'e çevir
-        if dtype in ['float64', 'float32']:
-            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-            # NaN'ları boş string'e çevirmek için object'e dönüştür
-            df[col] = df[col].apply(lambda x: "" if pd.isna(x) else x)
-        
-        # Integer sütunları - nullable int'leri işle
-        if pd.api.types.is_integer_dtype(dtype):
-            if df[col].isna().any():
-                df[col] = df[col].apply(lambda x: "" if pd.isna(x) else int(x))
-        
-        # Object tipi sütunları string'e dönüştür
-        if dtype == 'object':
-            df[col] = df[col].apply(
-                lambda x: "" if pd.isna(x) or x is None or str(x).lower() in ['nan', 'none', 'nat'] else str(x)
-            )
-    
-    # Tüm sütunları object/string tipine çevir (boş değerler için)
-    for col in df.columns:
-        df[col] = df[col].astype(str).replace('nan', '').replace('None', '').replace('NaT', '').replace('<NA>', '')
-    
+        # Tarih/Zaman
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            # NaT zaten Parquet null ile uyumludur
+            pass
+            
     return df
 
 
 def create_powerbi_compatible_schema(df: pd.DataFrame) -> pa.Schema:
     """
     Power BI ile uyumlu PyArrow şeması oluşturur.
-    Null değerli sütunlar için açık tip tanımı yapar.
+    Tüm alanları nullable yapar.
     """
     fields = []
     
     for col in df.columns:
         dtype = df[col].dtype
         
-        if dtype == 'int64':
+        pa_type = None
+        
+        if pd.api.types.is_integer_dtype(dtype):
             pa_type = pa.int64()
-        elif dtype == 'int32':
-            pa_type = pa.int32()
-        elif dtype == 'float64':
+        elif pd.api.types.is_float_dtype(dtype):
             pa_type = pa.float64()
-        elif dtype == 'float32':
-            pa_type = pa.float32()
-        elif dtype == 'bool':
+        elif pd.api.types.is_bool_dtype(dtype):
             pa_type = pa.bool_()
-        elif dtype == 'datetime64[ns]':
-            pa_type = pa.timestamp('ns')
-        elif dtype == 'object' or str(dtype) == 'string':
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            pa_type = pa.timestamp('ms') # Power BI genelde ms veya us sever
+        elif pd.api.types.is_string_dtype(dtype):
             pa_type = pa.string()
         else:
-            # Bilinmeyen tipler için string kullan
+            # Fallback
             pa_type = pa.string()
-        
+            
         fields.append(pa.field(col, pa_type, nullable=True))
     
     return pa.schema(fields)
@@ -145,26 +135,33 @@ def convert_excel_to_parquet(
         if progress_callback:
             progress_callback(50)
         
-        # Açık şema ile PyArrow Table oluştur
+        if progress_callback:
+            progress_callback(50)
+        
+        # Power BI uyumlu şema oluştur
         try:
-            schema = create_powerbi_compatible_schema(df_pandas)
+            # Basitçe pyarrow'un pandas'tan şema çıkarmasına izin verelim ama nullable olduğundan emin olalım
+            # Ancak manuel şema oluşturmak en güvenlisidir çünkü Power BI sütun tipleri konusunda hassastır.
+            # Şimdilik pa.Table.from_pandas'a bırakıp, sonra şemayı modifiye etmeyi deneyelim veya
+            # df'i temizledikten sonra direkt dönüştürelim.
             
-            # Sütun sütun array oluştur
-            arrays = []
-            for col in df_pandas.columns:
-                col_data = df_pandas[col].tolist()
-                try:
-                    arr = pa.array(col_data)
-                except Exception:
-                    # String'e zorla
-                    arr = pa.array([str(x) if x is not None and str(x) not in ['nan', 'None', 'NaN'] else "" for x in col_data], type=pa.string())
-                arrays.append(arr)
+            # En temiz yöntem: df zaten temizlendi (clean_dataframe_for_powerbi ile int64 vb yapıldı)
+            # PyArrow'un kendi tip çıkarımını kullanalım, genellikle oldukça iyidir.
             
-            table = pa.table(dict(zip(df_pandas.columns, arrays)))
+            table = pa.Table.from_pandas(df_pandas, preserve_index=False)
+            
+            # Şemadaki tüm alanları nullable olarak işaretle (Power BI hatasını önlemek için kritik)
+            new_fields = []
+            for field in table.schema:
+                new_fields.append(field.with_nullable(True))
+            
+            new_schema = pa.schema(new_fields)
+            table = table.cast(new_schema)
             
         except Exception as e:
-            # Fallback: Basit dönüşüm
-            table = pa.Table.from_pandas(df_pandas, preserve_index=False)
+            # Fallback: String'e çevirip öyle dene (eski yöntem, ama sadece hata durumunda)
+            df_str = df_pandas.astype(str)
+            table = pa.Table.from_pandas(df_str, preserve_index=False)
         
         if progress_callback:
             progress_callback(80)
