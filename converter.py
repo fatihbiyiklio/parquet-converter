@@ -1,6 +1,6 @@
 """
 Parquet Converter - Hızlı Excel → Parquet Dönüştürücü
-Polars tabanlı yüksek performanslı dönüştürme motoru
+Power BI uyumlu, tip güvenli dönüştürme motoru
 """
 
 import polars as pl
@@ -24,28 +24,73 @@ class ConversionResult:
         self.elapsed = elapsed
         self.error = error
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def clean_dataframe_for_powerbi(df: pd.DataFrame) -> pd.DataFrame:
     """
-    DataFrame'i Parquet uyumlu hale getirir.
-    Karışık tip sütunları ve özel değerleri temizler.
+    DataFrame'i Power BI uyumlu Parquet formatına hazırlar.
+    - Tamamen null sütunları varsayılan tipe çevirir
+    - Karışık tip sütunları string'e dönüştürür
+    - inf değerlerini temizler
     """
     import numpy as np
     
+    columns_to_drop = []
+    
     for col in df.columns:
+        # Tamamen null olan sütunları tespit et
+        if df[col].isna().all():
+            # Boş sütunu string tipine dönüştür ve boş string yap
+            df[col] = ""
+            continue
+        
         # inf değerlerini NaN'a çevir
         if df[col].dtype in ['float64', 'float32']:
             df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            # Float sütunlarındaki NaN'ları 0 ile doldur (Power BI uyumluluğu)
+            # df[col] = df[col].fillna(0)  # Opsiyonel
         
-        # object tipi sütunları string'e dönüştür (bytes vs int karışıklığını önler)
+        # object tipi sütunları string'e dönüştür
         if df[col].dtype == 'object':
             try:
-                # Karışık tipleri string'e zorla
-                df[col] = df[col].apply(lambda x: str(x) if pd.notna(x) and x is not None else None)
+                # Karışık tipleri string'e zorla, None'ları boş string yap
+                df[col] = df[col].apply(
+                    lambda x: str(x) if pd.notna(x) and x is not None else ""
+                )
             except Exception:
-                # Son çare: tüm sütunu string'e çevir
-                df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
+                df[col] = df[col].astype(str).replace('nan', '').replace('None', '')
     
     return df
+
+def create_powerbi_compatible_schema(df: pd.DataFrame) -> pa.Schema:
+    """
+    Power BI ile uyumlu PyArrow şeması oluşturur.
+    Null değerli sütunlar için açık tip tanımı yapar.
+    """
+    fields = []
+    
+    for col in df.columns:
+        dtype = df[col].dtype
+        
+        if dtype == 'int64':
+            pa_type = pa.int64()
+        elif dtype == 'int32':
+            pa_type = pa.int32()
+        elif dtype == 'float64':
+            pa_type = pa.float64()
+        elif dtype == 'float32':
+            pa_type = pa.float32()
+        elif dtype == 'bool':
+            pa_type = pa.bool_()
+        elif dtype == 'datetime64[ns]':
+            pa_type = pa.timestamp('ns')
+        elif dtype == 'object' or str(dtype) == 'string':
+            pa_type = pa.string()
+        else:
+            # Bilinmeyen tipler için string kullan
+            pa_type = pa.string()
+        
+        fields.append(pa.field(col, pa_type, nullable=True))
+    
+    return pa.schema(fields)
 
 def convert_excel_to_parquet(
     input_path: str,
@@ -53,8 +98,8 @@ def convert_excel_to_parquet(
     progress_callback: Optional[Callable[[int], None]] = None
 ) -> ConversionResult:
     """
-    Excel dosyasını Parquet formatına dönüştürür.
-    PyArrow ile doğrudan yazma - maksimum uyumluluk.
+    Excel dosyasını Power BI uyumlu Parquet formatına dönüştürür.
+    Tip güvenliği ve null işleme dahil.
     """
     start_time = time.time()
     
@@ -73,38 +118,53 @@ def convert_excel_to_parquet(
             progress_callback(10)
         
         # Pandas ile Excel okuma
-        df_pandas = pd.read_excel(input_path, engine='openpyxl')
+        try:
+            df_pandas = pd.read_excel(input_path, engine='openpyxl')
+        except Exception:
+            # xlrd ile eski Excel formatlarını dene
+            df_pandas = pd.read_excel(input_path, engine='xlrd')
         
         if progress_callback:
             progress_callback(30)
         
-        # DataFrame'i temizle
-        df_pandas = clean_dataframe(df_pandas)
+        # DataFrame'i Power BI uyumlu hale getir
+        df_pandas = clean_dataframe_for_powerbi(df_pandas)
         
         if progress_callback:
             progress_callback(50)
         
-        # PyArrow Table'a dönüştür (daha güvenilir)
+        # Açık şema ile PyArrow Table oluştur
         try:
-            table = pa.Table.from_pandas(df_pandas, preserve_index=False)
-        except Exception as e:
-            # Fallback: Sütun sütun dönüştür
-            columns = []
+            schema = create_powerbi_compatible_schema(df_pandas)
+            
+            # Sütun sütun array oluştur
+            arrays = []
             for col in df_pandas.columns:
+                col_data = df_pandas[col].tolist()
                 try:
-                    arr = pa.array(df_pandas[col].tolist())
+                    arr = pa.array(col_data)
                 except Exception:
                     # String'e zorla
-                    arr = pa.array([str(x) if pd.notna(x) else None for x in df_pandas[col]])
-                columns.append(arr)
+                    arr = pa.array([str(x) if x is not None and str(x) not in ['nan', 'None', 'NaN'] else "" for x in col_data], type=pa.string())
+                arrays.append(arr)
             
-            table = pa.table(dict(zip(df_pandas.columns, columns)))
+            table = pa.table(dict(zip(df_pandas.columns, arrays)))
+            
+        except Exception as e:
+            # Fallback: Basit dönüşüm
+            table = pa.Table.from_pandas(df_pandas, preserve_index=False)
         
         if progress_callback:
             progress_callback(80)
         
-        # Parquet olarak kaydet
-        pq.write_table(table, output_path, compression='snappy')
+        # Parquet olarak kaydet (Power BI uyumlu ayarlarla)
+        pq.write_table(
+            table, 
+            output_path, 
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
         
         if progress_callback:
             progress_callback(100)
@@ -138,7 +198,6 @@ def convert_multiple(
 ) -> list[ConversionResult]:
     """
     Birden fazla Excel dosyasını paralel olarak dönüştürür.
-    CPU çekirdek sayısına göre otomatik ölçeklenir.
     """
     if max_workers is None:
         max_workers = min(os.cpu_count() or 4, len(input_files))
