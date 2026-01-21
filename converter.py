@@ -27,38 +27,50 @@ class ConversionResult:
 def clean_dataframe_for_powerbi(df: pd.DataFrame) -> pd.DataFrame:
     """
     DataFrame'i Power BI uyumlu Parquet formatına hazırlar.
-    - Tamamen null sütunları varsayılan tipe çevirir
+    - NaT, null, None değerleri boş string'e çevirir
     - Karışık tip sütunları string'e dönüştürür
     - inf değerlerini temizler
     """
     import numpy as np
     
-    columns_to_drop = []
-    
     for col in df.columns:
-        # Tamamen null olan sütunları tespit et
+        dtype = df[col].dtype
+        
+        # Datetime sütunları - NaT değerlerini boş string'e çevir
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            df[col] = df[col].apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(x) else ""
+            )
+            continue
+        
+        # Tamamen null olan sütunları boş string yap
         if df[col].isna().all():
-            # Boş sütunu string tipine dönüştür ve boş string yap
             df[col] = ""
             continue
         
-        # inf değerlerini NaN'a çevir
-        if df[col].dtype in ['float64', 'float32']:
+        # Float sütunları - inf ve NaN'ı boş string'e çevir
+        if dtype in ['float64', 'float32']:
             df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-            # Float sütunlarındaki NaN'ları 0 ile doldur (Power BI uyumluluğu)
-            # df[col] = df[col].fillna(0)  # Opsiyonel
+            # NaN'ları boş string'e çevirmek için object'e dönüştür
+            df[col] = df[col].apply(lambda x: "" if pd.isna(x) else x)
         
-        # object tipi sütunları string'e dönüştür
-        if df[col].dtype == 'object':
-            try:
-                # Karışık tipleri string'e zorla, None'ları boş string yap
-                df[col] = df[col].apply(
-                    lambda x: str(x) if pd.notna(x) and x is not None else ""
-                )
-            except Exception:
-                df[col] = df[col].astype(str).replace('nan', '').replace('None', '')
+        # Integer sütunları - nullable int'leri işle
+        if pd.api.types.is_integer_dtype(dtype):
+            if df[col].isna().any():
+                df[col] = df[col].apply(lambda x: "" if pd.isna(x) else int(x))
+        
+        # Object tipi sütunları string'e dönüştür
+        if dtype == 'object':
+            df[col] = df[col].apply(
+                lambda x: "" if pd.isna(x) or x is None or str(x).lower() in ['nan', 'none', 'nat'] else str(x)
+            )
+    
+    # Tüm sütunları object/string tipine çevir (boş değerler için)
+    for col in df.columns:
+        df[col] = df[col].astype(str).replace('nan', '').replace('None', '').replace('NaT', '').replace('<NA>', '')
     
     return df
+
 
 def create_powerbi_compatible_schema(df: pd.DataFrame) -> pa.Schema:
     """
